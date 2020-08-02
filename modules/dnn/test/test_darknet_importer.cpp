@@ -408,6 +408,11 @@ TEST_P(Test_Darknet_layers, reorg)
     testDarknetLayer("reorg");
 }
 
+TEST_P(Test_Darknet_layers, relu)
+{
+    testDarknetLayer("relu");
+}
+
 INSTANTIATE_TEST_CASE_P(/**/, Test_Darknet_layers, dnnBackendsAndTargets());
 
 }} // namespace
