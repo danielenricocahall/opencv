@@ -140,8 +140,8 @@ void cvImageWidgetSetImage(CvImageWidget * widget, const CvArr *arr){
         widget->original_image = cvCreateMat( mat->rows, mat->cols, CV_8UC3 );
         gtk_widget_queue_resize( GTK_WIDGET( widget ) );
     }
-    cvConvertImage( mat, widget->original_image,
-                            (origin != 0 ? CV_CVTIMG_FLIP : 0) + CV_CVTIMG_SWAP_RB );
+    CV_Assert(origin == 0);
+    convertToShow(cv::cvarrToMat(arr), widget->original_image);
     if(widget->scaled_image){
         cvResize( widget->original_image, widget->scaled_image, CV_INTER_AREA );
     }
@@ -612,19 +612,33 @@ static std::vector< Ptr<CvWindow> > g_windows;
 CV_IMPL int cvInitSystem( int argc, char** argv )
 {
     static int wasInitialized = 0;
+    static bool hasError = false;
 
     // check initialization status
     if( !wasInitialized )
     {
-        gtk_init( &argc, &argv );
+        if (!gtk_init_check(&argc, &argv))
+        {
+            hasError = true;
+            wasInitialized = true;
+            CV_Error(Error::StsError, "Can't initialize GTK backend");
+        }
+
         setlocale(LC_NUMERIC,"C");
 
         #ifdef HAVE_OPENGL
-            gtk_gl_init(&argc, &argv);
+            if (!gtk_gl_init_check(&argc, &argv))
+            {
+                hasError = true;
+                wasInitialized = true;
+                CV_Error(Error::StsError, "Can't initialize GTK-OpenGL backend");
+            }
         #endif
 
         wasInitialized = 1;
     }
+    if (hasError)
+       CV_Error(Error::StsError, "GTK backend is not available");
 
     return 0;
 }

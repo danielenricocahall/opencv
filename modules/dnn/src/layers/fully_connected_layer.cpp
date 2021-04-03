@@ -42,8 +42,10 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../op_cuda.hpp"
 #include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
+#include "../ie_ngraph.hpp"
 
 #include <opencv2/dnn/shape_utils.hpp>
 
@@ -52,8 +54,9 @@
 using namespace cv::dnn::ocl4dnn;
 #endif
 
-#ifdef HAVE_DNN_NGRAPH
-#include "../ie_ngraph.hpp"
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/inner_product.hpp"
+using namespace cv::dnn::cuda4dnn;
 #endif
 
 namespace cv
@@ -116,7 +119,6 @@ public:
             CV_CheckEQ(inputs.size(), (size_t)2, "");
             numOutput = inputs[1].back();
             cAxis = inputs[0].size() - 1;
-            CV_CheckEQ(numOutput, inputs[0][cAxis - 1], "");
             int dims = inputs[0].size();
             CV_CheckEQ(inputs[1].size(), (size_t)dims, "");
             CV_CheckGE(dims, 2, "");
@@ -130,7 +132,7 @@ public:
             CV_CheckEQ(blobs[0].dims, 2, "");
             numOutput = blobs[0].size[0];
             CV_Assert(!bias || (size_t)numOutput == blobs[1].total());
-            cAxis = clamp(axis, inputs[0]);
+            cAxis = normalize_axis(axis, inputs[0]);
         }
 
         MatShape outShape(cAxis + 1);
@@ -145,6 +147,7 @@ public:
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
         return backendId == DNN_BACKEND_OPENCV ||
+               backendId == DNN_BACKEND_CUDA ||
                (backendId == DNN_BACKEND_HALIDE && haveHalide() && axis == 1) ||
                (((backendId == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && !blobs.empty()) ||
                 backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH) && axis == 1);
@@ -242,16 +245,18 @@ public:
             #if CV_SIMD128
                     for( ; i <= nw - 4; i += 4, wptr += 4*wstep )
                     {
-                        v_float32x4 vs0 = v_setall_f32(0.f), vs1 = v_setall_f32(0.f);
-                        v_float32x4 vs2 = v_setall_f32(0.f), vs3 = v_setall_f32(0.f);
+                        v_float32x4 vs0 = v_setall_f32(0.f);
+                        v_float32x4 vs1 = v_setall_f32(0.f);
+                        v_float32x4 vs2 = v_setall_f32(0.f);
+                        v_float32x4 vs3 = v_setall_f32(0.f);
 
                         for( k = 0; k < vecsize; k += 4 )
                         {
                             v_float32x4 v = v_load_aligned(sptr + k);
-                            vs0 += v*v_load_aligned(wptr + k);
-                            vs1 += v*v_load_aligned(wptr + wstep + k);
-                            vs2 += v*v_load_aligned(wptr + wstep*2 + k);
-                            vs3 += v*v_load_aligned(wptr + wstep*3 + k);
+                            vs0 = v_fma(v, v_load_aligned(wptr + k), vs0);
+                            vs1 = v_fma(v, v_load_aligned(wptr + wstep + k), vs1);
+                            vs2 = v_fma(v, v_load_aligned(wptr + wstep*2 + k), vs2);
+                            vs3 = v_fma(v, v_load_aligned(wptr + wstep*3 + k), vs3);
                         }
 
                         v_float32x4 s = v_reduce_sum4(vs0, vs1, vs2, vs3);
@@ -351,7 +356,7 @@ public:
             return true;
         }
 
-        int axisCan = clamp(axis, inputs[0].dims);
+        int axisCan = normalize_axis(axis, inputs[0].dims);
         int numOutput = blobs[0].size[0];
         int innerSize = blobs[0].size[1];
         int outerSize = total(shape(inputs[0]), 0, axisCan);
@@ -472,7 +477,7 @@ public:
 
         if (!blobs.empty())
         {
-            int axisCan = clamp(axis, input[0].dims);
+            int axisCan = normalize_axis(axis, input[0].dims);
             int outerSize = input[0].total(0, axisCan);
 
             for (size_t i = 0; i < input.size(); i++)
@@ -508,6 +513,24 @@ public:
             }
         }
     }
+
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(
+        void *context_,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs
+    ) override
+    {
+        auto context = reinterpret_cast<csl::CSLContext*>(context_);
+
+        auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
+
+        auto flatten_start_axis = normalize_axis(axis, input_wrapper->getRank());
+
+        auto biasMat_ = bias ? biasMat : Mat();
+        return make_cuda_node<cuda4dnn::InnerProductOp>(preferableTarget, std::move(context->stream), std::move(context->cublas_handle), flatten_start_axis, weightsMat, biasMat_);
+    }
+#endif
 
     virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
     {

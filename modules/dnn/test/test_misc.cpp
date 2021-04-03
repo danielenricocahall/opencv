@@ -99,6 +99,15 @@ TEST(readNet, do_not_call_setInput)  // https://github.com/opencv/opencv/issues/
     EXPECT_TRUE(res.empty()) << res.size;
 }
 
+TEST(Net, empty_forward_18392)
+{
+    cv::dnn::Net net;
+    Mat image(Size(512, 512), CV_8UC3, Scalar::all(0));
+    Mat inputBlob = cv::dnn::blobFromImage(image, 1.0, Size(512, 512), Scalar(0,0,0), true, false);
+    net.setInput(inputBlob);
+    EXPECT_ANY_THROW(Mat output = net.forward());
+}
+
 #ifdef HAVE_INF_ENGINE
 static
 void test_readNet_IE_do_not_call_setInput(Backend backendId)
@@ -245,8 +254,12 @@ TEST_P(setInput, normalization)
     const int target   = get<1>(get<3>(GetParam()));
     const bool kSwapRB = true;
 
+    if(backend == DNN_BACKEND_CUDA)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA);
     if (backend == DNN_BACKEND_OPENCV && target == DNN_TARGET_OPENCL_FP16 && dtype != CV_32F)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL_FP16);
+    if (backend == DNN_BACKEND_VKCOM && dtype != CV_32F)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_VULKAN);
 
     Mat inp(5, 5, CV_8UC3);
     randu(inp, 0, 255);

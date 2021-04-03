@@ -41,6 +41,7 @@
 //M*/
 
 #include "../precomp.hpp"
+#include "../op_cuda.hpp"
 #include <opencv2/dnn/shape_utils.hpp>
 #include <opencv2/dnn/all_layers.hpp>
 #include "../nms.inl.hpp"
@@ -53,6 +54,11 @@
 #include "../ie_ngraph.hpp"
 #endif
 
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/region.hpp"
+using namespace cv::dnn::cuda4dnn;
+#endif
+
 
 namespace cv
 {
@@ -63,7 +69,7 @@ class RegionLayerImpl CV_FINAL : public RegionLayer
 {
 public:
     int coords, classes, anchors, classfix;
-    float thresh, nmsThreshold, scale_x_y;
+    float thresh, scale_x_y;
     bool useSoftmax, useLogistic;
 #ifdef HAVE_OPENCL
     UMat blob_umat;
@@ -114,6 +120,10 @@ public:
 #ifdef HAVE_DNN_NGRAPH
     if (backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
         return INF_ENGINE_VER_MAJOR_GE(INF_ENGINE_RELEASE_2020_2) && preferableTarget != DNN_TARGET_MYRIAD;
+#endif
+#ifdef HAVE_CUDA
+        if (backendId == DNN_BACKEND_CUDA)
+            return true;
 #endif
         return backendId == DNN_BACKEND_OPENCV;
     }
@@ -349,6 +359,63 @@ public:
         }
     }
 
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(
+        void *context_,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs
+    ) override
+    {
+        auto context = reinterpret_cast<csl::CSLContext*>(context_);
+
+        if (coords != 4)
+            CV_Error(Error::StsNotImplemented, "Only upright rectangular boxes are supported in RegionLayer.");
+
+        std::size_t height_norm, width_norm;
+        if (inputs.size() == 1)
+        {
+            auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
+            auto input_shape = input_wrapper->getShape();
+            height_norm = input_shape[1];
+            width_norm = input_shape[2];
+        }
+        else
+        {
+            auto input_wrapper = inputs[1].dynamicCast<CUDABackendWrapper>();
+            auto input_shape = input_wrapper->getShape();
+            CV_Assert(input_shape.size() == 4);
+            height_norm = input_shape[2];
+            width_norm = input_shape[3];
+        }
+
+        cuda4dnn::SquashMethod squash_method;
+        if(useLogistic)
+            squash_method = cuda4dnn::SquashMethod::SIGMOID;
+        else if (useSoftmax)
+            squash_method = cuda4dnn::SquashMethod::SOFTMAX;
+
+        /* exactly one must be true */
+        CV_Assert((useLogistic || useSoftmax) && !(useLogistic && useSoftmax));
+
+        cuda4dnn::RegionConfiguration<float> config;
+        config.squash_method = squash_method;
+        config.classes = classes;
+        config.boxes_per_cell = anchors;
+
+        config.height_norm = height_norm;
+        config.width_norm = width_norm;
+
+        config.scale_x_y = scale_x_y;
+
+        config.object_prob_cutoff = (classfix == -1) ? 0.5 : 0.0;
+        config.class_prob_cutoff = thresh;
+
+        config.nms_iou_threshold = nmsThreshold;
+
+        return make_cuda_node<cuda4dnn::RegionOp>(preferableTarget, std::move(context->stream), blobs[0], config);
+    }
+#endif
+
     virtual int64 getFLOPS(const std::vector<MatShape> &inputs,
                            const std::vector<MatShape> &outputs) const CV_OVERRIDE
     {
@@ -393,8 +460,10 @@ public:
             std::vector<int64_t> mask(anchors, 1);
             region = std::make_shared<ngraph::op::RegionYolo>(tr_input, coords, classes, anchors, useSoftmax, mask, 1, 3, anchors_vec);
 
+            auto tr_shape = tr_input->get_shape();
             auto shape_as_inp = std::make_shared<ngraph::op::Constant>(ngraph::element::i64,
-                                                                       ngraph::Shape{tr_input->get_shape().size()}, tr_input->get_shape().data());
+                                                                       ngraph::Shape{tr_shape.size()},
+                                                                       std::vector<int64_t>(tr_shape.begin(), tr_shape.end()));
 
             region = std::make_shared<ngraph::op::v1::Reshape>(region, shape_as_inp, true);
             new_axes = std::make_shared<ngraph::op::Constant>(ngraph::element::i64, ngraph::Shape{4}, std::vector<int64_t>{0, 2, 3, 1});
@@ -540,7 +609,7 @@ public:
         result = std::make_shared<ngraph::op::Transpose>(result, tr_axes);
         if (b > 1)
         {
-            std::vector<size_t> sizes = {(size_t)b, result->get_shape()[0] / b, result->get_shape()[1]};
+            std::vector<int64_t> sizes{b, static_cast<int64_t>(result->get_shape()[0]) / b, static_cast<int64_t>(result->get_shape()[1])};
             auto shape_node = std::make_shared<ngraph::op::Constant>(ngraph::element::i64, ngraph::Shape{sizes.size()}, sizes.data());
             result = std::make_shared<ngraph::op::v1::Reshape>(result, shape_node, true);
         }

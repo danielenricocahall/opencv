@@ -77,7 +77,9 @@ class Builder:
             rm_one(d)
 
     def get_cmake_cmd(self):
-        cmd = ["cmake",
+        cmd = [
+            "cmake",
+            "-DPYTHON_DEFAULT_EXECUTABLE=%s" % sys.executable,
                "-DENABLE_PIC=FALSE", # To workaround emscripten upstream backend issue https://github.com/emscripten-core/emscripten/issues/8761
                "-DCMAKE_BUILD_TYPE=Release",
                "-DCMAKE_TOOLCHAIN_FILE='%s'" % self.get_toolchain_file(),
@@ -86,6 +88,7 @@ class Builder:
                "-DCV_TRACE=OFF",
                "-DBUILD_SHARED_LIBS=OFF",
                "-DWITH_1394=OFF",
+               "-DWITH_ADE=OFF",
                "-DWITH_VTK=OFF",
                "-DWITH_EIGEN=OFF",
                "-DWITH_FFMPEG=OFF",
@@ -112,15 +115,16 @@ class Builder:
                "-DWITH_GPHOTO2=OFF",
                "-DWITH_LAPACK=OFF",
                "-DWITH_ITT=OFF",
-               "-DWITH_QUIRC=OFF",
+               "-DWITH_QUIRC=ON",
                "-DBUILD_ZLIB=ON",
                "-DBUILD_opencv_apps=OFF",
                "-DBUILD_opencv_calib3d=ON",
                "-DBUILD_opencv_dnn=ON",
                "-DBUILD_opencv_features2d=ON",
-               "-DBUILD_opencv_flann=OFF",
+               "-DBUILD_opencv_flann=ON",  # No bindings provided. This module is used as a dependency for other modules.
+               "-DBUILD_opencv_gapi=OFF",
                "-DBUILD_opencv_ml=OFF",
-               "-DBUILD_opencv_photo=OFF",
+               "-DBUILD_opencv_photo=ON",
                "-DBUILD_opencv_imgcodecs=OFF",
                "-DBUILD_opencv_shape=OFF",
                "-DBUILD_opencv_videoio=OFF",
@@ -129,11 +133,9 @@ class Builder:
                "-DBUILD_opencv_superres=OFF",
                "-DBUILD_opencv_stitching=OFF",
                "-DBUILD_opencv_java=OFF",
-               "-DBUILD_opencv_java_bindings_generator=OFF",
                "-DBUILD_opencv_js=ON",
                "-DBUILD_opencv_python2=OFF",
                "-DBUILD_opencv_python3=OFF",
-               "-DBUILD_opencv_python_bindings_generator=OFF",
                "-DBUILD_EXAMPLES=OFF",
                "-DBUILD_PACKAGE=OFF",
                "-DBUILD_TESTS=OFF",
@@ -201,19 +203,26 @@ class Builder:
     def build_doc(self):
         execute(["make", "-j", str(multiprocessing.cpu_count()), "doxygen"])
 
+    def build_loader(self):
+        execute(["make", "-j", str(multiprocessing.cpu_count()), "opencv_js_loader"])
+
 
 #===================================================================================================
 
 if __name__ == "__main__":
+    log.basicConfig(format='%(message)s', level=log.DEBUG)
+
     opencv_dir = os.path.abspath(os.path.join(SCRIPT_DIR, '../..'))
     emscripten_dir = None
     if "EMSCRIPTEN" in os.environ:
         emscripten_dir = os.environ["EMSCRIPTEN"]
+    else:
+        log.warning("EMSCRIPTEN environment variable is not available. Please properly activate Emscripten SDK and consider using 'emcmake' launcher")
 
     parser = argparse.ArgumentParser(description='Build OpenCV.js by Emscripten')
     parser.add_argument("build_dir", help="Building directory (and output)")
     parser.add_argument('--opencv_dir', default=opencv_dir, help='Opencv source directory (default is "../.." relative to script location)')
-    parser.add_argument('--emscripten_dir', default=emscripten_dir, help="Path to Emscripten to use for build")
+    parser.add_argument('--emscripten_dir', default=emscripten_dir, help="Path to Emscripten to use for build (deprecated in favor of 'emcmake' launcher)")
     parser.add_argument('--build_wasm', action="store_true", help="Build OpenCV.js in WebAssembly format")
     parser.add_argument('--disable_wasm', action="store_true", help="Build OpenCV.js in Asm.js format")
     parser.add_argument('--threads', action="store_true", help="Build OpenCV.js with threads optimization")
@@ -221,6 +230,7 @@ if __name__ == "__main__":
     parser.add_argument('--build_test', action="store_true", help="Build tests")
     parser.add_argument('--build_perf', action="store_true", help="Build performance tests")
     parser.add_argument('--build_doc', action="store_true", help="Build tutorials")
+    parser.add_argument('--build_loader', action="store_true", help="Build OpenCV.js loader")
     parser.add_argument('--clean_build_dir', action="store_true", help="Clean build dir")
     parser.add_argument('--skip_config', action="store_true", help="Skip cmake config")
     parser.add_argument('--config_only', action="store_true", help="Only do cmake config")
@@ -236,13 +246,15 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    log.basicConfig(format='%(message)s', level=log.DEBUG)
     log.debug("Args: %s", args)
 
-    os.environ["OPENCV_JS_WHITELIST"] = args.config
+    os.environ["OPENCV_JS_WHITELIST"] = os.path.abspath(args.config)
+
+    if 'EMMAKEN_JUST_CONFIGURE' in os.environ:
+        del os.environ['EMMAKEN_JUST_CONFIGURE']  # avoid linker errors with NODERAWFS message then using 'emcmake' launcher
 
     if args.emscripten_dir is None:
-        log.info("Cannot get Emscripten path, please specify it either by EMSCRIPTEN environment variable or --emscripten_dir option.")
+        log.error("Cannot get Emscripten path, please use 'emcmake' launcher or specify it either by EMSCRIPTEN environment variable or --emscripten_dir option.")
         sys.exit(-1)
 
     builder = Builder(args)
@@ -292,6 +304,11 @@ if __name__ == "__main__":
         log.info("=====")
         builder.build_doc()
 
+    if args.build_loader:
+        log.info("=====")
+        log.info("===== Building OpenCV.js loader")
+        log.info("=====")
+        builder.build_loader()
 
     log.info("=====")
     log.info("===== Build finished")
@@ -316,3 +333,8 @@ if __name__ == "__main__":
         opencvjs_tutorial_path = find_file("tutorial_js_root.html", os.path.join(builder.build_dir, "doc", "doxygen", "html"))
         if check_file(opencvjs_tutorial_path):
             log.info("OpenCV.js tutorials location: %s", opencvjs_tutorial_path)
+
+    if args.build_loader:
+        opencvjs_loader_path = os.path.join(builder.build_dir, "bin", "loader.js")
+        if check_file(opencvjs_loader_path):
+            log.info("OpenCV.js loader location: %s", opencvjs_loader_path)

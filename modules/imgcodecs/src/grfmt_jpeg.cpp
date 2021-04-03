@@ -244,6 +244,7 @@ bool  JpegDecoder::readHeader()
 
         if (state->cinfo.src != 0)
         {
+            jpeg_save_markers(&state->cinfo, APP1, 0xffff);
             jpeg_read_header( &state->cinfo, TRUE );
 
             state->cinfo.scale_num=1;
@@ -456,6 +457,29 @@ bool  JpegDecoder::readData( Mat& img )
                 }
             }
 
+            // Check for Exif marker APP1
+            jpeg_saved_marker_ptr exif_marker = NULL;
+            jpeg_saved_marker_ptr cmarker = cinfo->marker_list;
+            while( cmarker && exif_marker == NULL )
+            {
+                if (cmarker->marker == APP1)
+                    exif_marker = cmarker;
+
+                cmarker = cmarker->next;
+            }
+
+            // Parse Exif data
+            if( exif_marker )
+            {
+                const std::streamsize offsetToTiffHeader = 6; //bytes from Exif size field to the first TIFF header
+
+                if (exif_marker->data_length > offsetToTiffHeader)
+                {
+                    m_exif.parseExif(exif_marker->data + offsetToTiffHeader, exif_marker->data_length - offsetToTiffHeader);
+                }
+            }
+
+
             jpeg_start_decompress( cinfo );
 
             buffer = (*cinfo->mem->alloc_sarray)((j_common_ptr)cinfo,
@@ -468,16 +492,16 @@ bool  JpegDecoder::readData( Mat& img )
                 if( color )
                 {
                     if( cinfo->out_color_components == 3 )
-                        icvCvt_RGB2BGR_8u_C3R( buffer[0], 0, data, 0, cvSize(m_width,1) );
+                        icvCvt_RGB2BGR_8u_C3R( buffer[0], 0, data, 0, Size(m_width,1) );
                     else
-                        icvCvt_CMYK2BGR_8u_C4C3R( buffer[0], 0, data, 0, cvSize(m_width,1) );
+                        icvCvt_CMYK2BGR_8u_C4C3R( buffer[0], 0, data, 0, Size(m_width,1) );
                 }
                 else
                 {
                     if( cinfo->out_color_components == 1 )
                         memcpy( data, buffer[0], m_width );
                     else
-                        icvCvt_CMYK2Gray_8u_C4C1R( buffer[0], 0, data, 0, cvSize(m_width,1) );
+                        icvCvt_CMYK2Gray_8u_C4C1R( buffer[0], 0, data, 0, Size(m_width,1) );
                 }
             }
 
@@ -704,12 +728,12 @@ bool JpegEncoder::write( const Mat& img, const std::vector<int>& params )
 
             if( _channels == 3 )
             {
-                icvCvt_BGR2RGB_8u_C3R( data, 0, buffer, 0, cvSize(width,1) );
+                icvCvt_BGR2RGB_8u_C3R( data, 0, buffer, 0, Size(width,1) );
                 ptr = buffer;
             }
             else if( _channels == 4 )
             {
-                icvCvt_BGRA2BGR_8u_C4C3R( data, 0, buffer, 0, cvSize(width,1), 2 );
+                icvCvt_BGRA2BGR_8u_C4C3R( data, 0, buffer, 0, Size(width,1), 2 );
                 ptr = buffer;
             }
 

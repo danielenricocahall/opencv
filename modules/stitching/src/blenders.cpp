@@ -70,7 +70,7 @@ Ptr<Blender> Blender::createDefault(int type, bool try_gpu)
     if (type == NO)
         return makePtr<Blender>();
     if (type == FEATHER)
-        return makePtr<FeatherBlender>();
+        return makePtr<FeatherBlender>(try_gpu);
     if (type == MULTI_BAND)
         return makePtr<MultiBandBlender>(try_gpu);
     CV_Error(Error::StsBadArg, "unsupported blending method");
@@ -132,7 +132,6 @@ void Blender::blend(InputOutputArray dst, InputOutputArray dst_mask)
     dst_.release();
     dst_mask_.release();
 }
-
 
 void FeatherBlender::prepare(Rect dst_roi)
 {
@@ -219,7 +218,7 @@ MultiBandBlender::MultiBandBlender(int try_gpu, int num_bands, int weight_type)
     num_bands_ = 0;
     setNumBands(num_bands);
 
-#if defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
+#if defined(HAVE_CUDA) && defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
     can_use_gpu_ = try_gpu && cuda::getCudaEnabledDeviceCount();
     gpu_feed_idx_ = 0;
 #else
@@ -230,7 +229,6 @@ MultiBandBlender::MultiBandBlender(int try_gpu, int num_bands, int weight_type)
     CV_Assert(weight_type == CV_32F || weight_type == CV_16S);
     weight_type_ = weight_type;
 }
-
 
 void MultiBandBlender::prepare(Rect dst_roi)
 {
@@ -246,7 +244,7 @@ void MultiBandBlender::prepare(Rect dst_roi)
 
     Blender::prepare(dst_roi);
 
-#if defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
+#if defined(HAVE_CUDA) && defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
     if (can_use_gpu_)
     {
         gpu_initialized_ = false;
@@ -332,7 +330,7 @@ void MultiBandBlender::feed(InputArray _img, InputArray mask, Point tl)
 
     UMat img;
 
-#if defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
+#if defined(HAVE_CUDA) && defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
     // If using gpu save the top left coordinate when running first time after prepare
     if (can_use_gpu_)
     {
@@ -353,7 +351,7 @@ void MultiBandBlender::feed(InputArray _img, InputArray mask, Point tl)
     {
         img = _img.getUMat();
     }
-#if defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
+#if defined(HAVE_CUDA) && defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
     else
     {
         gpu_img_ = _img.getGpuMat();
@@ -394,7 +392,7 @@ void MultiBandBlender::feed(InputArray _img, InputArray mask, Point tl)
     int bottom = br_new.y - tl.y - img.rows;
     int right = br_new.x - tl.x - img.cols;
 
-#if defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
+#if defined(HAVE_CUDA) && defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
     if (can_use_gpu_)
     {
         if (!gpu_initialized_)
@@ -603,7 +601,7 @@ void MultiBandBlender::feed(InputArray _img, InputArray mask, Point tl)
 void MultiBandBlender::blend(InputOutputArray dst, InputOutputArray dst_mask)
 {
     Rect dst_rc(0, 0, dst_roi_final_.width, dst_roi_final_.height);
-#if defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
+#if defined(HAVE_CUDA) && defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
     if (can_use_gpu_)
     {
         if (!gpu_initialized_)
@@ -720,12 +718,6 @@ void normalizeUsingWeightMap(InputArray _weight, InputOutputArray _src)
 {
     Mat src;
     Mat weight;
-#ifdef HAVE_TEGRA_OPTIMIZATION
-    src = _src.getMat();
-    weight = _weight.getMat();
-    if(tegra::useTegra() && tegra::normalizeUsingWeightMap(weight, src))
-        return;
-#endif
 
 #ifdef HAVE_OPENCL
     if ( !cv::ocl::isOpenCLActivated() ||
@@ -792,12 +784,6 @@ void createWeightMap(InputArray mask, float sharpness, InputOutputArray weight)
 
 void createLaplacePyr(InputArray img, int num_levels, std::vector<UMat> &pyr)
 {
-#ifdef HAVE_TEGRA_OPTIMIZATION
-    cv::Mat imgMat = img.getMat();
-    if(tegra::useTegra() && tegra::createLaplacePyr(imgMat, num_levels, pyr))
-        return;
-#endif
-
     pyr.resize(num_levels + 1);
 
     if(img.depth() == CV_8U)
@@ -850,7 +836,7 @@ void createLaplacePyr(InputArray img, int num_levels, std::vector<UMat> &pyr)
 
 void createLaplacePyrGpu(InputArray img, int num_levels, std::vector<UMat> &pyr)
 {
-#if defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
+#if defined(HAVE_CUDA) && defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
     pyr.resize(num_levels + 1);
 
     std::vector<cuda::GpuMat> gpu_pyr(num_levels + 1);
@@ -891,7 +877,7 @@ void restoreImageFromLaplacePyr(std::vector<UMat> &pyr)
 
 void restoreImageFromLaplacePyrGpu(std::vector<UMat> &pyr)
 {
-#if defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
+#if defined(HAVE_CUDA) && defined(HAVE_OPENCV_CUDAARITHM) && defined(HAVE_OPENCV_CUDAWARPING)
     if (pyr.empty())
         return;
 

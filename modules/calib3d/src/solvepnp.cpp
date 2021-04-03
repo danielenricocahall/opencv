@@ -47,7 +47,12 @@
 #include "p3p.h"
 #include "ap3p.h"
 #include "ippe.hpp"
-#include "opencv2/calib3d/calib3d_c.h"
+#include "sqpnp.hpp"
+#include "calib3d_c_api.h"
+
+#include "usac.hpp"
+
+#include <opencv2/core/utils/logger.hpp>
 
 namespace cv
 {
@@ -193,6 +198,21 @@ public:
     Mat tvec;
 };
 
+UsacParams::UsacParams()
+{
+    confidence = 0.99;
+    isParallel = false;
+    loIterations = 5;
+    loMethod = LocalOptimMethod::LOCAL_OPTIM_INNER_LO;
+    loSampleSize = 14;
+    maxIterations = 5000;
+    neighborsSearch = NeighborSearchMethod::NEIGH_GRID;
+    randomGeneratorState = 0;
+    sampler = SamplingMethod::SAMPLING_UNIFORM;
+    score = ScoreMethod::SCORE_METHOD_MSAC;
+    threshold = 1.5;
+}
+
 bool solvePnPRansac(InputArray _opoints, InputArray _ipoints,
                     InputArray _cameraMatrix, InputArray _distCoeffs,
                     OutputArray _rvec, OutputArray _tvec, bool useExtrinsicGuess,
@@ -200,6 +220,11 @@ bool solvePnPRansac(InputArray _opoints, InputArray _ipoints,
                     OutputArray _inliers, int flags)
 {
     CV_INSTRUMENT_REGION();
+
+    if (flags >= USAC_DEFAULT && flags <= USAC_MAGSAC)
+        return usac::solvePnPRansac(_opoints, _ipoints, _cameraMatrix, _distCoeffs,
+            _rvec, _tvec, useExtrinsicGuess, iterationsCount, reprojectionError,
+            confidence, _inliers, flags);
 
     Mat opoints0 = _opoints.getMat(), ipoints0 = _ipoints.getMat();
     Mat opoints, ipoints;
@@ -309,18 +334,42 @@ bool solvePnPRansac(InputArray _opoints, InputArray _ipoints,
 
     opoints_inliers.resize(npoints1);
     ipoints_inliers.resize(npoints1);
-    result = solvePnP(opoints_inliers, ipoints_inliers, cameraMatrix,
-                      distCoeffs, rvec, tvec, useExtrinsicGuess,
-                      (flags == SOLVEPNP_P3P || flags == SOLVEPNP_AP3P) ? SOLVEPNP_EPNP : flags) ? 1 : -1;
+    try
+    {
+        result = solvePnP(opoints_inliers, ipoints_inliers, cameraMatrix,
+                          distCoeffs, rvec, tvec, useExtrinsicGuess,
+                          (flags == SOLVEPNP_P3P || flags == SOLVEPNP_AP3P) ? SOLVEPNP_EPNP : flags) ? 1 : -1;
+    }
+    catch (const cv::Exception& e)
+    {
+        if (flags == SOLVEPNP_ITERATIVE &&
+            npoints1 == 5 &&
+            e.what() &&
+            std::string(e.what()).find("DLT algorithm needs at least 6 points") != std::string::npos
+        )
+        {
+            CV_LOG_INFO(NULL, "solvePnPRansac(): solvePnP stage to compute the final pose using points "
+                "in the consensus set raised DLT 6 points exception, use result from MSS (Minimal Sample Sets) stage instead.");
+            rvec = _local_model.col(0);    // output rotation vector
+            tvec = _local_model.col(1);    // output translation vector
+            result = 1;
+        }
+        else
+        {
+            // raise other exceptions
+            throw;
+        }
+    }
 
-    if( result <= 0 )
+    if (result <= 0)
     {
         _rvec.assign(_local_model.col(0));    // output rotation vector
         _tvec.assign(_local_model.col(1));    // output translation vector
 
-        if( _inliers.needed() )
+        if (_inliers.needed())
             _inliers.release();
 
+        CV_LOG_DEBUG(NULL, "solvePnPRansac(): solvePnP stage to compute the final pose using points in the consensus set failed. Return false");
         return false;
     }
     else
@@ -341,6 +390,28 @@ bool solvePnPRansac(InputArray _opoints, InputArray _ipoints,
     }
     return true;
 }
+
+
+bool solvePnPRansac( InputArray objectPoints, InputArray imagePoints,
+                     InputOutputArray cameraMatrix, InputArray distCoeffs,
+                     OutputArray rvec, OutputArray tvec, OutputArray inliers,
+                     const UsacParams &params) {
+    Ptr<usac::Model> model_params;
+    usac::setParameters(model_params, cameraMatrix.empty() ? usac::EstimationMethod::P6P :
+        usac::EstimationMethod::P3P, params, inliers.needed());
+    Ptr<usac::RansacOutput> ransac_output;
+    if (usac::run(model_params, imagePoints, objectPoints, model_params->getRandomGeneratorState(),
+            ransac_output, cameraMatrix, noArray(), distCoeffs, noArray())) {
+        usac::saveMask(inliers, ransac_output->getInliersMask());
+        const Mat &model = ransac_output->getModel();
+        model.col(0).copyTo(rvec);
+        model.col(1).copyTo(tvec);
+        if (cameraMatrix.empty())
+            model.colRange(2, 5).copyTo(cameraMatrix);
+        return true;
+    } else return false;
+}
+
 
 int solveP3P( InputArray _opoints, InputArray _ipoints,
               InputArray _cameraMatrix, InputArray _distCoeffs,
@@ -672,7 +743,7 @@ static void solvePnPRefine(InputArray _objectPoints, InputArray _imagePoints,
             params.at<double>(i+3,0) = tvec.at<double>(i,0);
         }
 
-        createLMSolver(makePtr<SolvePnPRefineLMCallback>(opoints, ipoints, cameraMatrix, distCoeffs), _criteria.maxCount, _criteria.epsilon)->run(params);
+        LMSolver::create(makePtr<SolvePnPRefineLMCallback>(opoints, ipoints, cameraMatrix, distCoeffs), _criteria.maxCount, _criteria.epsilon)->run(params);
 
         params.rowRange(0, 3).convertTo(rvec0, rvec0.depth());
         params.rowRange(3, 6).convertTo(tvec0, tvec0.depth());
@@ -750,7 +821,8 @@ int solvePnPGeneric( InputArray _opoints, InputArray _ipoints,
 
     Mat opoints = _opoints.getMat(), ipoints = _ipoints.getMat();
     int npoints = std::max(opoints.checkVector(3, CV_32F), opoints.checkVector(3, CV_64F));
-    CV_Assert( ( (npoints >= 4) || (npoints == 3 && flags == SOLVEPNP_ITERATIVE && useExtrinsicGuess) )
+    CV_Assert( ( (npoints >= 4) || (npoints == 3 && flags == SOLVEPNP_ITERATIVE && useExtrinsicGuess)
+                || (npoints >= 3 && flags == SOLVEPNP_SQPNP) )
                && npoints == std::max(ipoints.checkVector(2, CV_32F), ipoints.checkVector(2, CV_64F)) );
 
     opoints = opoints.reshape(3, npoints);
@@ -780,6 +852,15 @@ int solvePnPGeneric( InputArray _opoints, InputArray _ipoints,
     vector<Mat> vec_rvecs, vec_tvecs;
     if (flags == SOLVEPNP_EPNP || flags == SOLVEPNP_DLS || flags == SOLVEPNP_UPNP)
     {
+        if (flags == SOLVEPNP_DLS)
+        {
+            CV_LOG_DEBUG(NULL, "Broken implementation for SOLVEPNP_DLS. Fallback to EPnP.");
+        }
+        else if (flags == SOLVEPNP_UPNP)
+        {
+            CV_LOG_DEBUG(NULL, "Broken implementation for SOLVEPNP_UPNP. Fallback to EPnP.");
+        }
+
         Mat undistortedPoints;
         undistortPoints(ipoints, undistortedPoints, cameraMatrix, distCoeffs);
         epnp PnP(cameraMatrix, opoints, undistortedPoints);
@@ -926,6 +1007,14 @@ int solvePnPGeneric( InputArray _opoints, InputArray _ipoints,
             }
         } catch (...) { }
     }
+    else if (flags == SOLVEPNP_SQPNP)
+    {
+        Mat undistortedPoints;
+        undistortPoints(ipoints, undistortedPoints, cameraMatrix, distCoeffs);
+
+        sqpnp::PoseSolver solver;
+        solver.solve(opoints, undistortedPoints, vec_rvecs, vec_tvecs);
+    }
     /*else if (flags == SOLVEPNP_DLS)
     {
         Mat undistortedPoints;
@@ -953,7 +1042,8 @@ int solvePnPGeneric( InputArray _opoints, InputArray _ipoints,
         vec_tvecs.push_back(tvec);
     }*/
     else
-        CV_Error(CV_StsBadArg, "The flags argument must be one of SOLVEPNP_ITERATIVE, SOLVEPNP_P3P, SOLVEPNP_EPNP or SOLVEPNP_DLS");
+        CV_Error(CV_StsBadArg, "The flags argument must be one of SOLVEPNP_ITERATIVE, SOLVEPNP_P3P, "
+            "SOLVEPNP_EPNP, SOLVEPNP_DLS, SOLVEPNP_UPNP, SOLVEPNP_AP3P, SOLVEPNP_IPPE, SOLVEPNP_IPPE_SQUARE or SOLVEPNP_SQPNP");
 
     CV_Assert(vec_rvecs.size() == vec_tvecs.size());
 

@@ -9,6 +9,8 @@
 #include "opencv2/core/eigen.hpp"
 #endif
 
+#include "opencv2/core/cuda.hpp"
+
 namespace opencv_test { namespace {
 
 class Core_ReduceTest : public cvtest::BaseTest
@@ -952,7 +954,7 @@ void Core_ArrayOpTest::run( int /* start_from */)
 }
 
 
-template <class ElemType>
+template <class T>
 int calcDiffElemCountImpl(const vector<Mat>& mv, const Mat& m)
 {
     int diffElemCount = 0;
@@ -961,12 +963,12 @@ int calcDiffElemCountImpl(const vector<Mat>& mv, const Mat& m)
     {
         for(int x = 0; x < m.cols; x++)
         {
-            const ElemType* mElem = &m.at<ElemType>(y,x*mChannels);
+            const T* mElem = &m.at<T>(y, x*mChannels);
             size_t loc = 0;
             for(size_t i = 0; i < mv.size(); i++)
             {
                 const size_t mvChannel = mv[i].channels();
-                const ElemType* mvElem = &mv[i].at<ElemType>(y,x*(int)mvChannel);
+                const T* mvElem = &mv[i].at<T>(y, x*(int)mvChannel);
                 for(size_t li = 0; li < mvChannel; li++)
                     if(mElem[loc + li] != mvElem[li])
                         diffElemCount++;
@@ -1350,8 +1352,6 @@ TEST(Core_Matx, fromMat_)
     ASSERT_EQ( cvtest::norm(a, b, NORM_INF), 0.);
 }
 
-#ifdef CV_CXX11
-
 TEST(Core_Matx, from_initializer_list)
 {
     Mat_<double> a = (Mat_<double>(2,2) << 10, 11, 12, 13);
@@ -1365,8 +1365,6 @@ TEST(Core_Mat, regression_9507)
     cv::Mat m2{m};
     EXPECT_EQ(25u, m2.total());
 }
-
-#endif // CXX11
 
 TEST(Core_InputArray, empty)
 {
@@ -1644,7 +1642,6 @@ TEST(Mat, regression_10507_mat_setTo)
     }
 }
 
-#ifdef CV_CXX_STD_ARRAY
 TEST(Core_Mat_array, outputArray_create_getMat)
 {
     cv::Mat_<uchar> src_base(5, 1);
@@ -1733,7 +1730,6 @@ TEST(Core_Mat_array, SplitMerge)
         EXPECT_EQ(0, cvtest::norm(src[i], dst[i], NORM_INF));
     }
 }
-#endif
 
 TEST(Mat, regression_8680)
 {
@@ -1742,8 +1738,6 @@ TEST(Mat, regression_8680)
    mat.release();
    ASSERT_EQ(mat.channels(), 2);
 }
-
-#ifdef CV_CXX11
 
 TEST(Mat_, range_based_for)
 {
@@ -1805,8 +1799,6 @@ TEST(Mat_, template_based_ptr)
     int idx[4] = {1, 0, 0, 1};
     ASSERT_FLOAT_EQ(66.0f, *(mat.ptr<float>(idx)));
 }
-
-#endif
 
 
 BIGDATA_TEST(Mat, push_back_regression_4158)  // memory usage: ~10.6 Gb
@@ -1982,6 +1974,156 @@ TEST(Core_InputArray, fetch_MatExpr)
     EXPECT_EQ(expr_data, result.data);           // expr data is reused
     EXPECT_EQ(dst.size(), result.size());
 }
+
+
+#ifdef CV_CXX11
+class TestInputArrayRangeChecking {
+    static const char *kind2str(cv::_InputArray ia)
+    {
+        switch (ia.kind())
+        {
+        #define C(x) case cv::_InputArray::x: return #x
+        C(MAT);
+        C(UMAT);
+        C(EXPR);
+        C(MATX);
+        C(STD_VECTOR);
+        C(NONE);
+        C(STD_VECTOR_VECTOR);
+        C(STD_BOOL_VECTOR);
+        C(STD_VECTOR_MAT);
+        C(STD_ARRAY_MAT);
+        C(STD_VECTOR_UMAT);
+        C(CUDA_GPU_MAT);
+        C(STD_VECTOR_CUDA_GPU_MAT);
+        #undef C
+        default:
+            return "<unsupported>";
+        }
+    }
+
+    static void banner(cv::_InputArray ia, const char *label, const char *name)
+    {
+        std::cout << std::endl
+                  << label << " = " << name << ", Kind: " << kind2str(ia)
+                  << std::endl;
+    }
+
+    template<typename I, typename F>
+    static void testA(I ia, F f, const char *mfname)
+    {
+        banner(ia, "f", mfname);
+        EXPECT_THROW(f(ia, -1), cv::Exception)
+            << "f(ia, " << -1 << ") should throw cv::Exception";
+        for (int i = 0; i < int(ia.size()); i++)
+        {
+            EXPECT_NO_THROW(f(ia, i))
+                << "f(ia, " << i << ") should not throw an exception";
+        }
+        EXPECT_THROW(f(ia, int(ia.size())), cv::Exception)
+            << "f(ia, " << ia.size() << ") should throw cv::Exception";
+    }
+
+    template<typename I, typename F>
+    static void testB(I ia, F f, const char *mfname)
+    {
+        banner(ia, "f", mfname);
+        EXPECT_THROW(f(ia, -1), cv::Exception)
+            << "f(ia, " << -1 << ") should throw cv::Exception";
+        for (int i = 0; i < int(ia.size()); i++)
+        {
+            EXPECT_NO_THROW(f(ia, i))
+                << "f(ia, " << i << ") should not throw an exception";
+        }
+        EXPECT_THROW(f(ia, int(ia.size())), cv::Exception)
+            << "f(ia, " << ia.size() << ") should throw cv::Exception";
+    }
+
+    static void test_isContinuous()
+    {
+        auto f = [](cv::_InputArray ia, int i) { (void)ia.isContinuous(i); };
+
+        cv::Mat M;
+        cv::UMat uM;
+
+        std::vector<cv::Mat> vec = {M, M};
+        std::array<cv::Mat, 2> arr = {M, M};
+        std::vector<cv::UMat> uvec = {uM, uM};
+
+        testA(vec, f, "isContinuous");
+        testA(arr, f, "isContinuous");
+        testA(uvec, f, "isContinuous");
+    }
+
+    static void test_isSubmatrix()
+    {
+        auto f = [](cv::_InputArray ia, int i) { (void)ia.isSubmatrix(i); };
+
+        cv::Mat M;
+        cv::UMat uM;
+
+        std::vector<cv::Mat> vec = {M, M};
+        std::array<cv::Mat, 2> arr = {M, M};
+        std::vector<cv::UMat> uvec = {uM, uM};
+
+        testA(vec, f, "isSubmatrix");
+        testA(arr, f, "isSubmatrix");
+        testA(uvec, f, "isSubmatrix");
+    }
+
+    static void test_offset()
+    {
+        auto f = [](cv::_InputArray ia, int i) { return ia.offset(i); };
+
+        cv::Mat M;
+        cv::UMat uM;
+        cv::cuda::GpuMat gM;
+
+        std::vector<cv::Mat> vec = {M, M};
+        std::array<cv::Mat, 2> arr = {M, M};
+        std::vector<cv::UMat> uvec = {uM, uM};
+        std::vector<cv::cuda::GpuMat> gvec = {gM, gM};
+
+        testB(vec, f, "offset");
+        testB(arr, f, "offset");
+        testB(uvec, f, "offset");
+        testB(gvec, f, "offset");
+    }
+
+    static void test_step()
+    {
+        auto f = [](cv::_InputArray ia, int i) { return ia.step(i); };
+
+        cv::Mat M;
+        cv::UMat uM;
+        cv::cuda::GpuMat gM;
+
+        std::vector<cv::Mat> vec = {M, M};
+        std::array<cv::Mat, 2> arr = {M, M};
+        std::vector<cv::UMat> uvec = {uM, uM};
+        std::vector<cv::cuda::GpuMat> gvec = {gM, gM};
+
+        testB(vec, f, "step");
+        testB(arr, f, "step");
+        testB(uvec, f, "step");
+        testB(gvec, f, "step");
+    }
+
+public:
+    static void run()
+    {
+        test_isContinuous();
+        test_isSubmatrix();
+        test_offset();
+        test_step();
+    }
+};
+
+TEST(Core_InputArray, range_checking)
+{
+    TestInputArrayRangeChecking::run();
+}
+#endif
 
 
 TEST(Core_Vectors, issue_13078)
@@ -2184,5 +2326,33 @@ TEST(Mat, empty_iterator_16855)
     EXPECT_NO_THROW(m.end<uchar>());
     EXPECT_TRUE(m.begin<uchar>() == m.end<uchar>());
 }
+
+
+TEST(Mat, regression_18473)
+{
+    std::vector<int> sizes(3);
+    sizes[0] = 20;
+    sizes[1] = 50;
+    sizes[2] = 100;
+#if 1  // with the fix
+    std::vector<size_t> steps(2);
+    steps[0] = 50*100*2;
+    steps[1] = 100*2;
+#else  // without the fix
+    std::vector<size_t> steps(3);
+    steps[0] = 50*100*2;
+    steps[1] = 100*2;
+    steps[2] = 2;
+#endif
+    std::vector<short> data(20*50*100, 0);  // 1Mb
+    data[data.size() - 1] = 5;
+
+    // param steps Array of ndims-1 steps
+    Mat m(sizes, CV_16SC1, (void*)data.data(), (const size_t*)steps.data());
+
+    ASSERT_FALSE(m.empty());
+    EXPECT_EQ((int)5, (int)m.at<short>(19, 49, 99));
+}
+
 
 }} // namespace

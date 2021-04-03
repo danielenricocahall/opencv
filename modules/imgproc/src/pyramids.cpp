@@ -750,9 +750,9 @@ pyrDown_( const Mat& _src, Mat& _dst, int borderType )
     Size ssize = _src.size(), dsize = _dst.size();
     int cn = _src.channels();
 
-    int tabL[CV_CN_MAX*(PD_SZ+2)], tabR[CV_CN_MAX*(PD_SZ+2)];
-    AutoBuffer<int> _tabM(dsize.width*cn);
-    int* tabM = _tabM.data();
+    AutoBuffer<int> _tabM(dsize.width * cn), _tabL(cn * (PD_SZ + 2)),
+        _tabR(cn * (PD_SZ + 2));
+    int *tabM = _tabM.data(), *tabL = _tabL.data(), *tabR = _tabR.data();
 
     CV_Assert( ssize.width > 0 && ssize.height > 0 &&
                std::abs(dsize.width*2 - ssize.width) <= 2 &&
@@ -1277,11 +1277,6 @@ void cv::pyrDown( InputArray _src, OutputArray _dst, const Size& _dsz, int borde
 
     CALL_HAL(pyrDown, cv_hal_pyrdown, src.data, src.step, src.cols, src.rows, dst.data, dst.step, dst.cols, dst.rows, depth, src.channels(), borderType);
 
-#ifdef HAVE_TEGRA_OPTIMIZATION
-    if(borderType == BORDER_DEFAULT && tegra::useTegra() && tegra::pyrDown(src, dst))
-        return;
-#endif
-
 #ifdef HAVE_IPP
     bool isolated = (borderType & BORDER_ISOLATED) != 0;
     int borderTypeNI = borderType & ~BORDER_ISOLATED;
@@ -1384,11 +1379,6 @@ void cv::pyrUp( InputArray _src, OutputArray _dst, const Size& _dsz, int borderT
     _dst.create( dsz, src.type() );
     Mat dst = _dst.getMat();
     int depth = src.depth();
-
-#ifdef HAVE_TEGRA_OPTIMIZATION
-    if(borderType == BORDER_DEFAULT && tegra::useTegra() && tegra::pyrUp(src, dst))
-        return;
-#endif
 
 #ifdef HAVE_IPP
     bool isolated = (borderType & BORDER_ISOLATED) != 0;

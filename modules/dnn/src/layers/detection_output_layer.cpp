@@ -42,6 +42,7 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../op_cuda.hpp"
 #include "../op_inf_engine.hpp"
 
 #include <float.h>
@@ -59,7 +60,11 @@
 #else
 #include <ngraph/op/experimental/layers/detection_output.hpp>
 #endif
+#endif
 
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/detection_output.hpp"
+using namespace cv::dnn::cuda4dnn;
 #endif
 
 namespace cv
@@ -133,6 +138,12 @@ public:
 
     typedef std::map<int, std::vector<util::NormalizedBBox> > LabelBBox;
 
+    inline int getNumOfTargetClasses() {
+        unsigned numBackground =
+            (_backgroundLabelId >= 0 && _backgroundLabelId < _numClasses) ? 1 : 0;
+        return (_numClasses - numBackground);
+    }
+
     bool getParameterDict(const LayerParams &params,
                           const std::string &parameterName,
                           DictValue& result)
@@ -175,7 +186,7 @@ public:
 
     void getCodeType(const LayerParams &params)
     {
-        String codeTypeString = params.get<String>("code_type").toLowerCase();
+        String codeTypeString = toLowerCase(params.get<String>("code_type"));
         if (codeTypeString == "center_size")
             _codeType = "CENTER_SIZE";
         else
@@ -195,7 +206,7 @@ public:
         _locPredTransposed = getParameter<bool>(params, "loc_pred_transposed", 0, false, false);
         _bboxesNormalized = getParameter<bool>(params, "normalized_bbox", 0, false, true);
         _clip = getParameter<bool>(params, "clip", 0, false, false);
-        _groupByClasses = getParameter<bool>(params, "group_by_classes", 0, false, true);
+        _groupByClasses = getParameter<bool>(params, "group_by_classes", 0, false, false);
 
         getCodeType(params);
 
@@ -209,6 +220,7 @@ public:
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
         return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_CUDA && !_groupByClasses) ||
                ((backendId == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 || backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH) && !_locPredTransposed && _bboxesNormalized);
     }
 
@@ -584,12 +596,13 @@ public:
             LabelBBox::const_iterator label_bboxes = decodeBBoxes.find(label);
             if (label_bboxes == decodeBBoxes.end())
                 CV_Error_(cv::Error::StsError, ("Could not find location predictions for label %d", label));
+            int limit = (getNumOfTargetClasses() == 1) ? _keepTopK : std::numeric_limits<int>::max();
             if (_bboxesNormalized)
                 NMSFast_(label_bboxes->second, scores, _confidenceThreshold, _nmsThreshold, 1.0, _topK,
-                         indices[c], util::caffe_norm_box_overlap);
+                         indices[c], util::caffe_norm_box_overlap, limit);
             else
                 NMSFast_(label_bboxes->second, scores, _confidenceThreshold, _nmsThreshold, 1.0, _topK,
-                         indices[c], util::caffe_box_overlap);
+                         indices[c], util::caffe_box_overlap, limit);
             numDetections += indices[c].size();
         }
         if (_keepTopK > -1 && numDetections > (size_t)_keepTopK)
@@ -611,8 +624,13 @@ public:
                 }
             }
             // Keep outputs k results per image.
-            std::sort(scoreIndexPairs.begin(), scoreIndexPairs.end(),
-                      util::SortScorePairDescend<std::pair<int, int> >);
+            if ((_keepTopK * 8) > scoreIndexPairs.size()) {
+                std::sort(scoreIndexPairs.begin(), scoreIndexPairs.end(),
+                          util::SortScorePairDescend<std::pair<int, int> >);
+            } else {
+                std::partial_sort(scoreIndexPairs.begin(), scoreIndexPairs.begin() + _keepTopK, scoreIndexPairs.end(),
+                          util::SortScorePairDescend<std::pair<int, int> >);
+            }
             scoreIndexPairs.resize(_keepTopK);
 
             std::map<int, std::vector<int> > newIndices;
@@ -847,16 +865,16 @@ public:
         for (int i = 0; i < num; ++i, locData += numPredsPerClass * numLocClasses * 4)
         {
             LabelBBox& labelBBox = locPreds[i];
+            int start = shareLocation ? -1 : 0;
+            for (int c = 0; c < numLocClasses; ++c) {
+                labelBBox[start++].resize(numPredsPerClass);
+            }
             for (int p = 0; p < numPredsPerClass; ++p)
             {
                 int startIdx = p * numLocClasses * 4;
                 for (int c = 0; c < numLocClasses; ++c)
                 {
                     int label = shareLocation ? -1 : c;
-                    if (labelBBox.find(label) == labelBBox.end())
-                    {
-                        labelBBox[label].resize(numPredsPerClass);
-                    }
                     util::NormalizedBBox& bbox = labelBBox[label][p];
                     if (locPredTransposed)
                     {
@@ -928,6 +946,56 @@ public:
             return 0.;
         }
     }
+
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(
+        void *context_,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs
+    ) override
+    {
+        auto context = reinterpret_cast<csl::CSLContext*>(context_);
+
+        auto locations_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
+        auto locations_shape = locations_wrapper->getShape();
+
+        auto priors_wrapper = inputs[2].dynamicCast<CUDABackendWrapper>();
+        auto priors_shape = priors_wrapper->getShape();
+
+        cuda4dnn::DetectionOutputConfiguration config;
+        config.batch_size = locations_shape[0];
+
+        if (_codeType == "CORNER")
+        {
+            config.code_type = cuda4dnn::DetectionOutputConfiguration::CodeType::CORNER;
+        }
+        else if(_codeType == "CENTER_SIZE")
+        {
+            config.code_type = cuda4dnn::DetectionOutputConfiguration::CodeType::CENTER_SIZE;
+        }
+        else
+        {
+            CV_Error(Error::StsNotImplemented, _codeType + " code type not supported by CUDA backend in DetectionOutput layer");
+        }
+
+        config.share_location = _shareLocation;
+        config.num_priors = priors_shape[2] / 4;
+        config.num_classes = _numClasses;
+        config.background_class_id = _backgroundLabelId;
+
+        config.transpose_location = _locPredTransposed;
+        config.variance_encoded_in_target = _varianceEncodedInTarget;
+        config.normalized_bbox = _bboxesNormalized;
+        config.clip_box = _clip;
+
+        config.classwise_topK = _topK;
+        config.confidence_threshold = _confidenceThreshold;
+        config.nms_threshold = _nmsThreshold;
+
+        config.keepTopK = _keepTopK;
+        return make_cuda_node<cuda4dnn::DetectionOutputOp>(preferableTarget, std::move(context->stream), config);
+    }
+#endif
 
 #ifdef HAVE_DNN_IE_NN_BUILDER_2019
     virtual Ptr<BackendNode> initInfEngine(const std::vector<Ptr<BackendWrapper> >&) CV_OVERRIDE

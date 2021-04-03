@@ -216,13 +216,14 @@ public:
                     sample = Mat( nallvars, 1, CV_32F, psamples + sstep0*w->sidx[j], sstep1*sizeof(psamples[0]) );
 
                     double val = predictTrees(Range(treeidx, treeidx+1), sample, predictFlags);
+                    double sample_weight = w->sample_weights[w->sidx[j]];
                     if( !_isClassifier )
                     {
                         oobres[j] += val;
                         oobcount[j]++;
                         double true_val = w->ord_responses[w->sidx[j]];
                         double a = oobres[j]/oobcount[j] - true_val;
-                        oobError += a*a;
+                        oobError += sample_weight * a*a;
                         val = (val - true_val)/max_response;
                         ncorrect_responses += std::exp( -val*val );
                     }
@@ -237,7 +238,7 @@ public:
                             if( votes[best_class] < votes[k] )
                                 best_class = k;
                         int diff = best_class != w->cat_responses[w->sidx[j]];
-                        oobError += diff;
+                        oobError += sample_weight * diff;
                         ncorrect_responses += diff == 0;
                     }
                 }
@@ -421,6 +422,10 @@ public:
         }
     }
 
+    double getOOBError() const {
+        return oobError;
+    }
+
     RTreeParams rparams;
     double oobError;
     vector<float> varImportance;
@@ -456,6 +461,7 @@ public:
     inline void setRegressionAccuracy(float val) CV_OVERRIDE { impl.params.setRegressionAccuracy(val); }
     inline cv::Mat getPriors() const CV_OVERRIDE { return impl.params.getPriors(); }
     inline void setPriors(const cv::Mat& val) CV_OVERRIDE { impl.params.setPriors(val); }
+    inline void getVotes(InputArray input, OutputArray output, int flags) const CV_OVERRIDE {return impl.getVotes(input,output,flags);}
 
     RTreesImpl() {}
     virtual ~RTreesImpl() CV_OVERRIDE {}
@@ -489,12 +495,6 @@ public:
         impl.read(fn);
     }
 
-    void getVotes_( InputArray samples, OutputArray results, int flags ) const
-    {
-        CV_TRACE_FUNCTION();
-        impl.getVotes(samples, results, flags);
-    }
-
     Mat getVarImportance() const CV_OVERRIDE { return Mat_<float>(impl.varImportance, true); }
     int getVarCount() const CV_OVERRIDE { return impl.getVarCount(); }
 
@@ -505,6 +505,8 @@ public:
     const vector<Node>& getNodes() const CV_OVERRIDE { return impl.getNodes(); }
     const vector<Split>& getSplits() const CV_OVERRIDE { return impl.getSplits(); }
     const vector<int>& getSubsets() const CV_OVERRIDE { return impl.getSubsets(); }
+    double getOOBError() const CV_OVERRIDE { return impl.getOOBError(); }
+
 
     DTreesImplForRTrees impl;
 };
@@ -521,15 +523,6 @@ Ptr<RTrees> RTrees::load(const String& filepath, const String& nodeName)
 {
     CV_TRACE_FUNCTION();
     return Algorithm::load<RTrees>(filepath, nodeName);
-}
-
-void RTrees::getVotes(InputArray input, OutputArray output, int flags) const
-{
-    CV_TRACE_FUNCTION();
-    const RTreesImpl* this_ = dynamic_cast<const RTreesImpl*>(this);
-    if(!this_)
-        CV_Error(Error::StsNotImplemented, "the class is not RTreesImpl");
-    return this_->getVotes_(input, output, flags);
 }
 
 }}

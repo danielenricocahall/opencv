@@ -27,14 +27,14 @@ gen_template_check_self = Template("""
 gen_template_call_constructor_prelude = Template("""new (&(self->v)) Ptr<$cname>(); // init Ptr with placement new
         if(self) """)
 
-gen_template_call_constructor = Template("""self->v.reset(new ${cname}${args})""")
+gen_template_call_constructor = Template("""self->v.reset(new ${cname}${py_args})""")
 
 gen_template_simple_call_constructor_prelude = Template("""if(self) """)
 
-gen_template_simple_call_constructor = Template("""new (&(self->v)) ${cname}${args}""")
+gen_template_simple_call_constructor = Template("""new (&(self->v)) ${cname}${py_args}""")
 
 gen_template_parse_args = Template("""const char* keywords[] = { $kw_list, NULL };
-    if( PyArg_ParseTupleAndKeywords(args, kw, "$fmtspec", (char**)keywords, $parse_arglist)$code_cvt )""")
+    if( PyArg_ParseTupleAndKeywords(py_args, kw, "$fmtspec", (char**)keywords, $parse_arglist)$code_cvt )""")
 
 gen_template_func_body = Template("""$code_decl
     $code_parse
@@ -47,7 +47,7 @@ gen_template_func_body = Template("""$code_decl
 gen_template_mappable = Template("""
     {
         ${mappable} _src;
-        if (pyopencv_to(src, _src, info))
+        if (pyopencv_to_safe(src, _src, info))
         {
             return cv_mappable_to(_src, dst);
         }
@@ -91,7 +91,7 @@ gen_template_set_prop_from_map = Template("""
     if( PyMapping_HasKeyString(src, (char*)"$propname") )
     {
         tmp = PyMapping_GetItemString(src, (char*)"$propname");
-        ok = tmp && pyopencv_to(tmp, dst.$propname, ArgInfo("$propname", false));
+        ok = tmp && pyopencv_to_safe(tmp, dst.$propname, ArgInfo("$propname", false));
         Py_DECREF(tmp);
         if(!ok) return false;
     }""")
@@ -145,7 +145,7 @@ static int pyopencv_${name}_set_${member}(pyopencv_${name}_t* p, PyObject *value
         PyErr_SetString(PyExc_TypeError, "Cannot delete the ${member} attribute");
         return -1;
     }
-    return pyopencv_to(value, p->v${access}${member}, ArgInfo("value", false)) ? 0 : -1;
+    return pyopencv_to_safe(value, p->v${access}${member}, ArgInfo("value", false)) ? 0 : -1;
 }
 """)
 
@@ -163,7 +163,7 @@ static int pyopencv_${name}_set_${member}(pyopencv_${name}_t* p, PyObject *value
         failmsgp("Incorrect type of object (must be '${name}' or its derivative)");
         return -1;
     }
-    return pyopencv_to(value, _self_${access}${member}, ArgInfo("value", false)) ? 0 : -1;
+    return pyopencv_to_safe(value, _self_${access}${member}, ArgInfo("value", false)) ? 0 : -1;
 }
 """)
 
@@ -173,6 +173,14 @@ gen_template_prop_init = Template("""
 
 gen_template_rw_prop_init = Template("""
     {(char*)"${member}", (getter)pyopencv_${name}_get_${member}, (setter)pyopencv_${name}_set_${member}, (char*)"${member}", NULL},""")
+
+gen_template_overloaded_function_call = Template("""
+    {
+${variant}
+
+        pyPopulateArgumentConversionErrors();
+    }
+""")
 
 class FormatStrings:
     string = 's'
@@ -201,7 +209,8 @@ simple_argtype_mapping = {
     "int": ArgTypeInfo("int", FormatStrings.int, "0", True),
     "float": ArgTypeInfo("float", FormatStrings.float, "0.f", True),
     "double": ArgTypeInfo("double", FormatStrings.double, "0", True),
-    "c_string": ArgTypeInfo("char*", FormatStrings.string, '(char*)""')
+    "c_string": ArgTypeInfo("char*", FormatStrings.string, '(char*)""'),
+    "string": ArgTypeInfo("std::string", FormatStrings.object, None, True),
 }
 
 
@@ -257,7 +266,12 @@ class ClassInfo(object):
 
             for m in decl[2]:
                 if m.startswith("="):
-                    self.wname = m[1:]
+                    wname = m[1:]
+                    npos = name.rfind('.')
+                    if npos >= 0:
+                        self.wname = normalize_class_name(name[:npos] + '.' + wname)
+                    else:
+                        self.wname = wname
                     customname = True
                 elif m == "/Map":
                     self.ismap = True
@@ -273,7 +287,7 @@ class ClassInfo(object):
         code = "static bool pyopencv_to(PyObject* src, %s& dst, const ArgInfo& info)\n{\n    PyObject* tmp;\n    bool ok;\n" % (self.cname)
         code += "".join([gen_template_set_prop_from_map.substitute(propname=p.name,proptype=p.tp) for p in self.props])
         if self.base:
-            code += "\n    return pyopencv_to(src, (%s&)dst, info);\n}\n" % all_classes[self.base].cname
+            code += "\n    return pyopencv_to_safe(src, (%s&)dst, info);\n}\n" % all_classes[self.base].cname
         else:
             code += "\n    return true;\n}\n"
         return code
@@ -336,7 +350,8 @@ class ClassInfo(object):
         if self.constructor is not None:
             constructor_name = self.constructor.get_wrapper_name()
 
-        return "CVPY_TYPE({}, {}, {}, {}, {});\n".format(
+        return "CVPY_TYPE({}, {}, {}, {}, {}, {});\n".format(
+            self.wname,
             self.name,
             self.cname if self.issimple else "Ptr<{}>".format(self.cname),
             self.sname if self.issimple else "Ptr",
@@ -362,6 +377,7 @@ class ArgInfo(object):
         self.inputarg = True
         self.outputarg = False
         self.returnarg = False
+        self.isrvalueref = False
         for m in arg_tuple[3]:
             if m == "/O":
                 self.inputarg = False
@@ -377,12 +393,13 @@ class ArgInfo(object):
             elif m.startswith("/CA"):
                 self.isarray = True
                 self.arraycvt = m[2:].strip()
+            elif m == "/RRef":
+                self.isrvalueref = True
         self.py_inputarg = False
         self.py_outputarg = False
 
     def isbig(self):
-        return self.tp == "Mat" or self.tp == "vector_Mat" or self.tp == "cuda::GpuMat"\
-               or self.tp == "UMat" or self.tp == "vector_UMat" # or self.tp.startswith("vector")
+        return self.tp in ["Mat", "vector_Mat", "cuda::GpuMat", "GpuMat", "vector_GpuMat", "UMat", "vector_UMat"] # or self.tp.startswith("vector")
 
     def crepr(self):
         return "ArgInfo(\"%s\", %d)" % (self.name, self.outputarg)
@@ -530,14 +547,14 @@ class FuncInfo(object):
     def get_wrapper_prototype(self, codegen):
         full_fname = self.get_wrapper_name()
         if self.isconstructor:
-            return "static int {fn_name}(pyopencv_{type_name}_t* self, PyObject* args, PyObject* kw)".format(
+            return "static int {fn_name}(pyopencv_{type_name}_t* self, PyObject* py_args, PyObject* kw)".format(
                     fn_name=full_fname, type_name=codegen.classes[self.classname].name)
 
         if self.classname:
             self_arg = "self"
         else:
             self_arg = ""
-        return "static PyObject* %s(PyObject* %s, PyObject* args, PyObject* kw)" % (full_fname, self_arg)
+        return "static PyObject* %s(PyObject* %s, PyObject* py_args, PyObject* kw)" % (full_fname, self_arg)
 
     def get_tab_entry(self):
         prototype_list = []
@@ -657,7 +674,7 @@ class FuncInfo(object):
                         if a.tp == 'char':
                             code_cvt_list.append("convert_to_char(pyobj_%s, &%s, %s)" % (a.name, a.name, a.crepr()))
                         else:
-                            code_cvt_list.append("pyopencv_to(pyobj_%s, %s, %s)" % (a.name, a.name, a.crepr()))
+                            code_cvt_list.append("pyopencv_to_safe(pyobj_%s, %s, %s)" % (a.name, a.name, a.crepr()))
 
                 all_cargs.append([arg_type_info, parse_name])
 
@@ -683,6 +700,10 @@ class FuncInfo(object):
 
                 if not code_args.endswith("("):
                     code_args += ", "
+
+                if a.isrvalueref:
+                    a.name = 'std::move(' + a.name + ')'
+
                 code_args += amp + a.name
 
             code_args += ")"
@@ -696,7 +717,7 @@ class FuncInfo(object):
                     templ = gen_template_call_constructor
 
                 code_prelude = templ_prelude.substitute(name=selfinfo.name, cname=selfinfo.cname)
-                code_fcall = templ.substitute(name=selfinfo.name, cname=selfinfo.cname, args=code_args)
+                code_fcall = templ.substitute(name=selfinfo.name, cname=selfinfo.cname, py_args=code_args)
                 if v.isphantom:
                     code_fcall = code_fcall.replace("new " + selfinfo.cname, self.cname.replace("::", "_"))
             else:
@@ -745,7 +766,7 @@ class FuncInfo(object):
                     parse_arglist = ", ".join(["&" + all_cargs[argno][1] for aname, argno in v.py_arglist]),
                     code_cvt = " &&\n        ".join(code_cvt_list))
             else:
-                code_parse = "if(PyObject_Size(args) == 0 && (!kw || PyObject_Size(kw) == 0))"
+                code_parse = "if(PyObject_Size(py_args) == 0 && (!kw || PyObject_Size(kw) == 0))"
 
             if len(v.py_outlist) == 0:
                 code_ret = "Py_RETURN_NONE"
@@ -768,8 +789,12 @@ class FuncInfo(object):
             # if the function/method has only 1 signature, then just put it
             code += all_code_variants[0]
         else:
-            # try to execute each signature
-            code += "    PyErr_Clear();\n\n".join(["    {\n" + v + "    }\n" for v in all_code_variants])
+            # try to execute each signature, add an interlude between function
+            # calls to collect error from all conversions
+            code += '    pyPrepareArgumentConversionErrorsStorage({});\n'.format(len(all_code_variants))
+            code += '    \n'.join(gen_template_overloaded_function_call.substitute(variant=v)
+                                  for v in all_code_variants)
+            code += '    pyRaiseCVOverloadException("{}");\n'.format(self.name)
 
         def_ret = "NULL"
         if self.isconstructor:
@@ -900,7 +925,7 @@ class PythonWrapperGenerator(object):
         if classes:
             classname = normalize_class_name('.'.join(namespace+classes))
             bareclassname = classes[-1]
-        namespace = '.'.join(namespace)
+        namespace_str = '.'.join(namespace)
 
         isconstructor = name == bareclassname
         is_static = False
@@ -925,23 +950,36 @@ class PythonWrapperGenerator(object):
         if is_static:
             # Add it as a method to the class
             func_map = self.classes[classname].methods
-            func = func_map.setdefault(name, FuncInfo(classname, name, cname, isconstructor, namespace, is_static))
+            func = func_map.setdefault(name, FuncInfo(classname, name, cname, isconstructor, namespace_str, is_static))
             func.add_variant(decl, isphantom)
 
             # Add it as global function
             g_name = "_".join(classes+[name])
-            func_map = self.namespaces.setdefault(namespace, Namespace()).funcs
-            func = func_map.setdefault(g_name, FuncInfo("", g_name, cname, isconstructor, namespace, False))
+            w_classes = []
+            for i in range(0, len(classes)):
+                classes_i = classes[:i+1]
+                classname_i = normalize_class_name('.'.join(namespace+classes_i))
+                w_classname = self.classes[classname_i].wname
+                namespace_prefix = normalize_class_name('.'.join(namespace)) + '_'
+                if w_classname.startswith(namespace_prefix):
+                    w_classname = w_classname[len(namespace_prefix):]
+                w_classes.append(w_classname)
+            g_wname = "_".join(w_classes+[name])
+            func_map = self.namespaces.setdefault(namespace_str, Namespace()).funcs
+            func = func_map.setdefault(g_name, FuncInfo("", g_name, cname, isconstructor, namespace_str, False))
             func.add_variant(decl, isphantom)
+            if g_wname != g_name:  # TODO OpenCV 5.0
+                wfunc = func_map.setdefault(g_wname, FuncInfo("", g_wname, cname, isconstructor, namespace_str, False))
+                wfunc.add_variant(decl, isphantom)
         else:
             if classname and not isconstructor:
                 if not isphantom:
                     cname = barename
                 func_map = self.classes[classname].methods
             else:
-                func_map = self.namespaces.setdefault(namespace, Namespace()).funcs
+                func_map = self.namespaces.setdefault(namespace_str, Namespace()).funcs
 
-            func = func_map.setdefault(name, FuncInfo(classname, name, cname, isconstructor, namespace, is_static))
+            func = func_map.setdefault(name, FuncInfo(classname, name, cname, isconstructor, namespace_str, is_static))
             func.add_variant(decl, isphantom)
 
         if classname and isconstructor:
@@ -957,6 +995,8 @@ class PythonWrapperGenerator(object):
             if func.isconstructor:
                 continue
             self.code_ns_reg.write(func.get_tab_entry())
+        custom_entries_macro = 'PYOPENCV_EXTRA_METHODS_{}'.format(wname.upper())
+        self.code_ns_reg.write('#ifdef {}\n    {}\n#endif\n'.format(custom_entries_macro, custom_entries_macro))
         self.code_ns_reg.write('    {NULL, NULL}\n};\n\n')
 
         self.code_ns_reg.write('static ConstDef consts_%s[] = {\n'%wname)
@@ -965,6 +1005,8 @@ class PythonWrapperGenerator(object):
             compat_name = re.sub(r"([a-z])([A-Z])", r"\1_\2", name).upper()
             if name != compat_name:
                 self.code_ns_reg.write('    {"%s", static_cast<long>(%s)},\n'%(compat_name, cname))
+        custom_entries_macro = 'PYOPENCV_EXTRA_CONSTANTS_{}'.format(wname.upper())
+        self.code_ns_reg.write('#ifdef {}\n    {}\n#endif\n'.format(custom_entries_macro, custom_entries_macro))
         self.code_ns_reg.write('    {NULL, 0}\n};\n\n')
 
     def gen_enum_reg(self, enum_name):
@@ -979,7 +1021,7 @@ class PythonWrapperGenerator(object):
 
         code = ""
         if re.sub(r"^cv\.", "", enum_name) != wname:
-            code += "typedef enum {0} {1};\n".format(cname, wname)
+            code += "typedef {0} {1};\n".format(cname, wname)
         code += "CV_PY_FROM_ENUM({0});\nCV_PY_TO_ENUM({0});\n\n".format(wname)
         self.code_enums.write(code)
 
@@ -994,15 +1036,21 @@ class PythonWrapperGenerator(object):
 
     def gen(self, srcfiles, output_path):
         self.clear()
-        self.parser = hdr_parser.CppHeaderParser(generate_umat_decls=True, generate_gpumat_decls=False)
+        self.parser = hdr_parser.CppHeaderParser(generate_umat_decls=True, generate_gpumat_decls=True)
 
         # step 1: scan the headers and build more descriptive maps of classes, consts, functions
         for hdr in srcfiles:
             decls = self.parser.parse(hdr)
             if len(decls) == 0:
                 continue
-            if hdr.find('opencv2/') >= 0: #Avoid including the shadow files
-                self.code_include.write( '#include "{0}"\n'.format(hdr[hdr.rindex('opencv2/'):]) )
+
+            if hdr.find('misc/python/shadow_') < 0:  # Avoid including the "shadow_" files
+                if hdr.find('opencv2/') >= 0:
+                    # put relative path
+                    self.code_include.write('#include "{0}"\n'.format(hdr[hdr.rindex('opencv2/'):]))
+                else:
+                    self.code_include.write('#include "{0}"\n'.format(hdr))
+
             for decl in decls:
                 name = decl[0]
                 if name.startswith("struct") or name.startswith("class"):

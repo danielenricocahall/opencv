@@ -42,12 +42,19 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../op_cuda.hpp"
 #include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../ie_ngraph.hpp"
+#include "../op_vkcom.hpp"
 
 #ifdef HAVE_OPENCL
 #include "opencl_kernels_dnn.hpp"
+#endif
+
+#ifdef HAVE_CUDA
+#include "../cuda4dnn/primitives/concat.hpp"
+using namespace cv::dnn::cuda4dnn;
 #endif
 
 namespace cv
@@ -72,7 +79,7 @@ public:
     {
         CV_Assert(inputs.size() > 0);
         outputs.resize(1, inputs[0]);
-        int cAxis = clamp(axis, inputs[0]);
+        int cAxis = normalize_axis(axis, inputs[0]);
 
         int axisSum = 0;
         for (size_t i = 0; i < inputs.size(); i++)
@@ -105,9 +112,11 @@ public:
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
         return backendId == DNN_BACKEND_OPENCV ||
+               backendId == DNN_BACKEND_CUDA ||
                (backendId == DNN_BACKEND_HALIDE && haveHalide() && axis == 1 && !padding) ||  // By channels
                (backendId == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && haveInfEngine() && !padding) ||
-               backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH;
+               backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||
+               (backendId == DNN_BACKEND_VKCOM && haveVulkan() && !padding);
     }
 
     class ChannelConcatInvoker : public ParallelLoopBody
@@ -192,7 +201,7 @@ public:
         inps.getUMatVector(inputs);
         outs.getUMatVector(outputs);
 
-        int cAxis = clamp(axis, inputs[0].dims);
+        int cAxis = normalize_axis(axis, inputs[0].dims);
         if (padding)
             return false;
 
@@ -246,7 +255,7 @@ public:
         inputs_arr.getMatVector(inputs);
         outputs_arr.getMatVector(outputs);
 
-        int cAxis = clamp(axis, inputs[0].dims);
+        int cAxis = normalize_axis(axis, inputs[0].dims);
         Mat& outMat = outputs[0];
 
         if (padding)
@@ -275,6 +284,32 @@ public:
                 ranges[cAxis].start = ranges[cAxis].end;
             }
         }
+    }
+
+#ifdef HAVE_CUDA
+    Ptr<BackendNode> initCUDA(
+        void *context_,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs
+    ) override
+    {
+        auto context = reinterpret_cast<csl::CSLContext*>(context_);
+
+        auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
+        auto concat_axis = normalize_axis(axis, input_wrapper->getRank());
+        return make_cuda_node<cuda4dnn::ConcatOp>(preferableTarget, std::move(context->stream), concat_axis, padding);
+    }
+#endif
+
+    virtual Ptr<BackendNode> initVkCom(const std::vector<Ptr<BackendWrapper> > &input) CV_OVERRIDE
+    {
+#ifdef HAVE_VULKAN
+        vkcom::Tensor in = VkComTensor(input[0]);
+        int cAxis = normalize_axis(axis, in.dimNum());
+        std::shared_ptr<vkcom::OpBase> op(new vkcom::OpConcat(cAxis));
+        return Ptr<BackendNode>(new VkComBackendNode(input, op));
+#endif // HAVE_VULKAN
+        return Ptr<BackendNode>();
     }
 
     virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &input) CV_OVERRIDE
@@ -306,7 +341,7 @@ public:
         InferenceEngine::DataPtr input = infEngineDataNode(inputs[0]);
 
         InferenceEngine::Builder::ConcatLayer ieLayer(name);
-        ieLayer.setAxis(clamp(axis, input->getDims().size()));
+        ieLayer.setAxis(normalize_axis(axis, input->getDims().size()));
         ieLayer.setInputPorts(std::vector<InferenceEngine::Port>(inputs.size()));
         return Ptr<BackendNode>(new InfEngineBackendNode(ieLayer));
     }
@@ -319,7 +354,7 @@ public:
     {
         InferenceEngine::DataPtr data = ngraphDataNode(inputs[0]);
         const int numDims = data->getDims().size();
-        const int cAxis = clamp(axis, numDims);
+        const int cAxis = normalize_axis(axis, numDims);
         std::vector<size_t> maxDims(numDims, 0);
 
         CV_Assert(inputs.size() == nodes.size());
